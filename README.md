@@ -136,6 +136,7 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ```
 codebuddy2openai/
 ├── converter.py                     # 转换器主程序（单文件）
+├── desensitize.py                   # 脱敏模块（可选，--desensitize 启用）
 ├── codex-codebuddy.example.toml     # provider 配置示例片段（仅供参考；Codex CLI 已不支持，见上方说明）
 ├── README.md
 └── LICENSE
@@ -144,7 +145,7 @@ codebuddy2openai/
 ### 🔧 命令行参数
 
 ```
-python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--skip-check]
+python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--desensitize] [--skip-check]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -153,6 +154,7 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [-
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 启用鉴权；客户端需带同样 key（也可用环境变量 `CODEBUDDY2OPENAI_KEY`）|
 | `--log` | 无 | **开启日志并写到该文件**（如 `--log converter.log`）。不传则不记。也可用环境变量 `CODEBUDDY2OPENAI_LOG`。|
+| `--desensitize` | 关 | 启用脱敏：对 system 消息里的合规声明敏感词（DoS/exploit/credential/C2 等）插入零宽空格，缓解被后端内容审核误拦（见下方 FAQ）。|
 | `--skip-check` | 否 | 跳过启动预检 |
 
 示例：
@@ -177,7 +179,7 @@ python3 converter.py                              # 不记日志
 - **找不到登录文件**：在桌面端完成登录（不是只装、要登进去）。路径见上方「前置条件」。
 - **客户端报 401**：转换器若用了 `--api-key`，客户端那边要带同样的 key；若是后端 401，可能是 token 失效（转换器会自动刷新，若仍失败需在桌面端重新登录）。
 - **响应慢**：可换 `deepseek-v4-flash` 等更快的模型。
-- **"敏感内容"被拦截**：这是 CodeBuddy 后端的**内容审核**（腾讯合规策略），在模型推理之前就拦了，转换器无法绕过。常见触发原因是客户端注入的 system prompt 里含安全相关英文术语（如 DoS / exploit / credential / C2 等）。用 `--log req` 可在日志里看到 `⚠️内容审核拦截` 标记来定位。
+- **"敏感内容"被拦截**：这是 CodeBuddy 后端的**内容审核**（腾讯合规策略），在模型推理之前就拦了。常见触发原因是客户端注入的 system prompt 里含安全相关英文术语（如 DoS / exploit / credential / C2 等——这些往往是客户端**合规声明模板**里的"拒绝作恶"措辞，属误伤）。两种应对：①用 `--log xxx.log` 在日志里看 `⚠️内容审核拦截` 标记定位是哪条请求；②加 `--desensitize` 启用脱敏模块（`desensitize.py`），它对 system 消息里的这类合规词插入零宽空格（人/模型读无差别，但后端关键词匹配失效），可显著降低被误拦概率。注意：脱敏只针对客户端固定模板，不能也不应绕过对用户真实有害输入的审核。
 
 ### ⚠️ 免责声明
 

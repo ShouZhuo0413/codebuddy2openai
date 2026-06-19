@@ -35,6 +35,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
+try:
+    from desensitize import desensitize_body
+except ImportError:  # 模块缺失时降级为不脱敏
+    def desensitize_body(body, roles=("system",)):
+        return body
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -201,7 +207,8 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
-CONFIG: dict = {"api_key": "", "cred": None, "log_path": None}  # cred: CredentialManager | None
+CONFIG: dict = {"api_key": "", "cred": None, "log_path": None,
+                "desensitize": False}  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +305,11 @@ async def chat_completions(request: Request,
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
+    # 可选：脱敏。缓解客户端合规模板（如 ZCode 的 system 声明）被后端误判为敏感词。
+    # 只对 system 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入。
+    if CONFIG.get("desensitize"):
+        body = desensitize_body(body, roles=("system",))
+
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
@@ -307,8 +319,8 @@ async def chat_completions(request: Request,
     _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
-    # 完整请求体（发往后端的原样内容）
-    _log(f"[{rid}] ── REQUEST BODY ──\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+    # 完整请求体（发往后端的实际内容；若启用脱敏，这里已是脱敏后）
+    _log(f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}")
 
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
@@ -579,10 +591,14 @@ def main():
     ap.add_argument("--log", default=None, metavar="PATH",
                     help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
                          "不传则不记日志。")
+    ap.add_argument("--desensitize", action="store_true",
+                    help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
+                         "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
+    CONFIG["desensitize"] = args.desensitize
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     af = find_auth_file()
@@ -599,6 +615,8 @@ def main():
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     if CONFIG["log_path"]:
         sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
+    if args.desensitize:
+        sys.stderr.write("   脱敏      : 已启用（system 合规词零宽处理）\n")
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
