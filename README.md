@@ -15,10 +15,11 @@
 ### ✨ 特性
 
 - 🔄 **OpenAI 兼容**：标准 `/v1/chat/completions`（支持流式 SSE）、`/v1/models`、`/health`。
+- 🛠️ **Function Calling（工具调用）**：支持请求里的 `tools`，返回 OpenAI 格式的 `tool_calls`，可在 ZCode / Cherry Studio 等 agent 客户端里驱动工具、多轮回传结果。
 - 🪶 **单文件、极简**：核心就一个 `converter.py`，不复杂。
 - 🔐 **零授权改动**：直接调用本机已登录的 `codebuddy` CLI，自动复用桌面端登录态，不重新登录、不存密码。
 - 🖥️ **跨平台**：自动定位 macOS / Windows / Linux 上的 CLI 与登录文件。
-- 🛡️ **安全**：默认只监听 `127.0.0.1`；调用 CLI 时禁用所有内置工具，纯对话，不会动你的文件。
+- 🛡️ **安全**：默认只监听 `127.0.0.1`；调用 CLI 时禁用 CLI 内置工具，工具的声明与执行都由你的客户端负责。
 - ⚡ **流式输出**：实时增量 token，体验与原生 OpenAI 流式一致。
 
 ### 🧠 它是怎么工作的
@@ -70,6 +71,18 @@ python3 converter.py
 ```
 
 启动时会做一次预检，打印找到的 CLI 和登录文件路径。
+
+### 🛠️ Function Calling（工具调用）是怎么实现的
+
+CodeBuddy CLI 只能选它**内置**的工具（Bash/Read/Edit…），不能注入客户端自定义的工具。为了让 ZCode / Cherry Studio 等 agent 客户端的工具也能用，转换器做了这层适配：
+
+1. 客户端在请求里带上标准 OpenAI 的 `tools`（`[{"type":"function","function":{...}}]`）。
+2. 转换器把工具说明格式化后注入对话（并约定模型用 `<tool_call>{"name":...,"arguments":...}</tool_call>` 格式输出）。
+3. 调 CLI 时用 `--tools ""` 禁用其内置工具，让模型**只产出 tool call 文本、不自己执行**。
+4. 转换器解析模型输出里的 `<tool_call>` 块，转成 OpenAI 的 `tool_calls`（`finish_reason:"tool_calls"`）返回。
+5. 客户端执行完工具，把 `role:"tool"` 的结果再发回来，转换器拼回对话上下文，模型据此继续。
+
+这样**工具的声明和执行都由客户端负责**，转换器只做协议桥接——客户端能用自己的全部工具集。
 
 ### 🔌 接入客户端
 
@@ -201,5 +214,5 @@ License: [MIT](./LICENSE)
 
 <!-- SEO keywords -->
 <sub>
-**Keywords / 关键词:** codebuddy to openai · codebuddy2openai · codebuddy openai compatible api · codebuddy api proxy · codebuddy workbuddy openai adapter · tencent codebuddy openai · use codebuddy in codex · codex cli codebuddy · codebuddy glm-5.2 api · codebuddy kimi deepseek openai · openai compatible proxy local llm gateway · 腾讯代码助手 openai · codebuddy 转 openai · codebuddy 接入 codex · 本地大模型代理 openai 协议 · codebuddy 订阅 复用 · workbuddy api 转换
+**Keywords / 关键词:** codebuddy to openai · codebuddy2openai · codebuddy openai compatible api · codebuddy api proxy · codebuddy workbuddy openai adapter · tencent codebuddy openai · codebuddy glm-5.2 api · codebuddy kimi deepseek openai · openai compatible proxy local llm gateway · codebuddy function calling · codebuddy tool use tool_calls · codebuddy zcode cherry studio · 腾讯代码助手 openai · codebuddy 转 openai · codebuddy 接入 zcode cherry studio · 本地大模型代理 openai 协议 · codebuddy 订阅 复用 · workbuddy api 转换 · codebuddy 工具调用
 </sub>

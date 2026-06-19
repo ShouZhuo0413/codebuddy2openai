@@ -23,13 +23,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Iterable, Optional
+from typing import AsyncGenerator, Iterable, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -127,6 +128,30 @@ DEFAULT_MODELS = [
 # OpenAI messages -> CLI prompt
 # ---------------------------------------------------------------------------
 
+# 工具调用标签（模型按此约定输出，转换器解析）
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+
+# 注入到对话里的「可用工具说明 + 输出约定」
+TOOLS_SYSTEM_PROMPT = """\
+# Available tools
+You may call tools to help answer the user's request. Tools are described below as JSON Schemas.
+
+To call a tool, output ONLY this block and nothing else (no prose before or after):
+{open}
+{{"name": "<tool_name>", "arguments": {{<json object matching the tool's parameters>}}}}
+{close}
+
+Rules:
+- Output the {open}...{close} block verbatim. The JSON inside must be valid (double quotes, no trailing commas).
+- Call AT MOST ONE tool per turn. Wait for the result before continuing.
+- If you do not need a tool, answer the user directly in plain text.
+- "arguments" must match the tool's parameter schema. Omit unknown fields.
+
+## Tools
+""".format(open=TOOL_CALL_OPEN, close=TOOL_CALL_CLOSE)
+
+
 def _content_to_text(content) -> str:
     if isinstance(content, list):
         bits = []
@@ -141,18 +166,159 @@ def _content_to_text(content) -> str:
     return content
 
 
-def messages_to_prompt(messages: list[dict]) -> str:
-    """把 OpenAI messages 数组拼成纯文本 prompt，保留角色与多轮上下文。"""
+def _format_tools(tools: list[dict]) -> str:
+    """把 OpenAI tools（[{"type":"function","function":{...}}]）渲染成可读说明。"""
+    lines: list[str] = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if t.get("type") == "function" else t
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name", "?")
+        desc = (fn.get("description") or "").strip()
+        params = fn.get("parameters") or {}
+        lines.append(f"- {name}: {desc}")
+        # 简要列参数
+        props = params.get("properties") if isinstance(params, dict) else None
+        if isinstance(props, dict) and props:
+            required = params.get("required", []) if isinstance(params, dict) else []
+            pstrs = []
+            for pname, pinfo in props.items():
+                if not isinstance(pinfo, dict):
+                    continue
+                ptype = pinfo.get("type", "any")
+                pdesc = (pinfo.get("description") or "").strip().split("\n")[0]
+                req = "required" if pname in required else "optional"
+                pstrs.append(f'    - {pname} ({ptype}, {req}): {pdesc}')
+            if pstrs:
+                lines.append("  parameters:")
+                lines.extend(pstrs)
+    return "\n".join(lines)
+
+
+def messages_to_prompt(messages: list[dict], tools: list[dict] | None = None) -> str:
+    """把 OpenAI messages 数组拼成纯文本 prompt，保留角色与多轮上下文。
+
+    若 tools 非空，注入工具说明，并处理 assistant 的 tool_calls 与 tool 结果。
+    """
     parts: list[str] = []
+
+    # 1) 若有工具，先注入工具说明
+    if tools:
+        parts.append("[system]\n" + TOOLS_SYSTEM_PROMPT + _format_tools(tools))
+
+    # 2) 遍历 messages
     for m in messages:
         role = m.get("role", "user")
+        if role == "assistant" and m.get("tool_calls"):
+            # assistant 发起的工具调用：还原成约定的 <tool_call> 文本
+            calls = []
+            for tc in m.get("tool_calls") or []:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                name = fn.get("name")
+                args = fn.get("arguments", "{}")
+                # arguments 可能是 JSON 字符串或对象
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        pass
+                calls.append(json.dumps({"name": name, "arguments": args}, ensure_ascii=False))
+            block = TOOL_CALL_OPEN + "\n" + "\n".join(calls) + "\n" + TOOL_CALL_CLOSE
+            extra = _content_to_text(m.get("content", "")).strip()
+            parts.append(f"[assistant]\n{block}" + (f"\n{extra}" if extra else ""))
+            continue
+
+        if role == "tool":
+            # 工具执行结果回传
+            tid = m.get("tool_call_id", "")
+            text = _content_to_text(m.get("content", "")).strip()
+            parts.append(f"[tool result{(' id=' + tid) if tid else ''}]\n{text}")
+            continue
+
         text = _content_to_text(m.get("content", "")).strip()
         if not text:
             continue
-        tag = {"system": "system", "user": "user", "assistant": "assistant",
-               "tool": "tool result"}.get(role, role)
+        tag = {"system": "system", "user": "user", "assistant": "assistant"}.get(role, role)
         parts.append(f"[{tag}]\n{text}")
+
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 解析模型输出里的 <tool_call> 块 -> OpenAI tool_calls
+# ---------------------------------------------------------------------------
+
+_TOOL_CALL_RE = re.compile(
+    re.escape(TOOL_CALL_OPEN) + r"(.*?)" + re.escape(TOOL_CALL_CLOSE),
+    re.DOTALL,
+)
+
+
+def parse_tool_calls(text: str) -> list[dict]:
+    """从模型输出文本里解析所有 <tool_call> 块，返回 OpenAI tool_calls 列表（可能为空）。"""
+    calls: list[dict] = []
+    for m in _TOOL_CALL_RE.finditer(text):
+        raw = m.group(1).strip()
+        # 块里可能有多个 JSON（每行一个），也可能是一个对象
+        for cand in _split_json_objects(raw):
+            try:
+                obj = json.loads(cand)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            name = obj.get("name")
+            args = obj.get("arguments", {})
+            if name is None:
+                continue
+            if isinstance(args, (dict, list)):
+                args = json.dumps(args, ensure_ascii=False)
+            elif not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            calls.append({
+                "id": "call_" + uuid.uuid4().hex[:24],
+                "type": "function",
+                "function": {"name": str(name), "arguments": args},
+            })
+    return calls
+
+
+def strip_tool_call_blocks(text: str) -> str:
+    """去掉所有 <tool_call> 块，返回剩余纯文本（用于 content 字段）。"""
+    cleaned = _TOOL_CALL_RE.sub("", text)
+    return cleaned.strip()
+
+
+def _split_json_objects(s: str) -> list[str]:
+    """把可能含多个 JSON 对象的字符串，按顶层 { } 边界切分。"""
+    objs: list[str] = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objs.append(s[start:i + 1])
+                start = -1
+    return objs
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +473,17 @@ def _usage_to_openai(usage: dict | None) -> dict:
     return {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}
 
 
-def make_chat_completion(text: str, model: str, usage: dict | None) -> dict:
+def make_chat_completion(text: str, model: str, usage: dict | None,
+                         tools: list[dict] | None = None) -> dict:
+    tool_calls = parse_tool_calls(text) if tools else []
+    if tool_calls:
+        # 模型发起了工具调用：返回 tool_calls，content 去掉 tool_call 块
+        content = strip_tool_call_blocks(text) or None
+        message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+        finish = "tool_calls"
+    else:
+        message = {"role": "assistant", "content": text}
+        finish = "stop"
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex,
         "object": "chat.completion",
@@ -315,20 +491,24 @@ def make_chat_completion(text: str, model: str, usage: dict | None) -> dict:
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish,
         }],
         "usage": _usage_to_openai(usage),
     }
 
 
 def sse_chunk(cid: str, model: str, *, delta_content: str | None = None,
-              role: str | None = None, finish_reason: str | None = None) -> str:
+              role: str | None = None, finish_reason: str | None = None,
+              tool_calls: list[dict] | None = None,
+              tool_call_index: int | None = None) -> str:
     delta: dict = {}
     if role is not None:
         delta["role"] = role
     if delta_content is not None:
         delta["content"] = delta_content
+    if tool_calls is not None:
+        delta["tool_calls"] = tool_calls
     chunk = {
         "id": cid,
         "object": "chat.completion.chunk",
@@ -399,7 +579,8 @@ async def chat_completions(request: Request,
 
     model = payload.get("model") or "auto"
     stream = bool(payload.get("stream"))
-    prompt = messages_to_prompt(messages)
+    tools = payload.get("tools") or None
+    prompt = messages_to_prompt(messages, tools)
     cwd = CONFIG["cwd"]
 
     # 启动 CLI（同步子进程）；在异步上下文中放线程池执行，避免阻塞事件循环
@@ -411,7 +592,7 @@ async def chat_completions(request: Request,
 
     if stream:
         return StreamingResponse(
-            _stream_response(loop, make_iter, model),
+            _stream_response(loop, make_iter, model, tools),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -433,11 +614,17 @@ async def chat_completions(request: Request,
             usage = ev.get("usage")
         elif k == "error":
             raise HTTPException(status_code=502, detail={"error": {"message": ev.get("message", "error"), "type": "upstream_error"}})
-    return JSONResponse(make_chat_completion(final_text, model, usage))
+    return JSONResponse(make_chat_completion(final_text, model, usage, tools))
 
 
-async def _stream_response(loop, make_iter, model: str) -> AsyncGenerator[bytes, None]:
-    """把 CLI 事件流转换成 OpenAI SSE。CLI 读取放到线程池里逐行消费。"""
+async def _stream_response(loop, make_iter, model: str,
+                           tools: list[dict] | None = None) -> AsyncGenerator[bytes, None]:
+    """把 CLI 事件流转换成 OpenAI SSE。CLI 读取放到线程池里逐行消费。
+
+    有 tools 时：tool_calls 以文本形式产出且可能跨多个 delta，因此先缓冲完整文本，
+    再在结尾判断是否是工具调用（若是则输出 tool_calls，否则整段输出文本）。
+    无 tools 时：逐 delta 实时流式输出。
+    """
     import asyncio
     cid = "chatcmpl-" + uuid.uuid4().hex
 
@@ -459,6 +646,48 @@ async def _stream_response(loop, make_iter, model: str) -> AsyncGenerator[bytes,
     loop.run_in_executor(None, producer)
 
     had_error = False
+
+    if tools:
+        # 有工具：缓冲完整文本，结尾统一判定
+        # 注意：normalize_events 先 yield 多个 delta，再 yield 一个 final（含完整文本）。
+        # final.text 已是完整文本，deltas 是它的片段，二者不可叠加，否则重复。
+        delta_parts: list[str] = []   # 仅在没收到 final 时兜底
+        final_text: str | None = None
+        while True:
+            item = await queue.get()
+            if item is SENTINEL:
+                break
+            k = item.get("kind")
+            if k == "delta":
+                delta_parts.append(item.get("text", ""))
+            elif k == "final":
+                final_text = item.get("text", "")
+            elif k == "error":
+                had_error = True
+                yield sse_chunk(cid, model, delta_content=f"[error] {item.get('message','')}").encode("utf-8")
+
+        full_text = final_text if final_text is not None else "".join(delta_parts)
+        tool_calls = parse_tool_calls(full_text)
+        if had_error:
+            yield sse_chunk(cid, model, finish_reason="error").encode("utf-8")
+        elif tool_calls:
+            # 流式发 tool_calls（OpenAI 约定：每个 call 一个 chunk，arguments 可分片）
+            for idx, tc in enumerate(tool_calls):
+                yield sse_chunk(cid, model, tool_calls=[{
+                    "index": idx,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+                }]).encode("utf-8")
+            yield sse_chunk(cid, model, finish_reason="tool_calls").encode("utf-8")
+        else:
+            # 不是工具调用：把文本作为单个 content delta 发出
+            yield sse_chunk(cid, model, delta_content=full_text).encode("utf-8")
+            yield sse_chunk(cid, model, finish_reason="stop").encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
+
+    # 无工具：逐 delta 实时流式
     while True:
         item = await queue.get()
         if item is SENTINEL:
