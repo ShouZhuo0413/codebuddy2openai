@@ -201,8 +201,7 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
-CONFIG: dict = {"api_key": "", "cred": None, "log_level": "req",
-                "log_path": None}  # cred: CredentialManager | None
+CONFIG: dict = {"api_key": "", "cred": None, "log_path": None}  # cred: CredentialManager | None
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +211,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_level": "req",
 _LOG_LOCK = threading.Lock()
 
 
-def _log(level: str, msg: str):
-    """按级别写日志到文件。level: req/debug。低于当前 log_level 则丢弃。
-
-    日志文件由 CONFIG['log_path'] 指定（main 启动时设置）；每次追加写、带时间戳。
-    """
-    order = {"off": 0, "req": 1, "debug": 2}
-    if order.get(level, 1) > order.get(CONFIG.get("log_level", "req"), 1):
-        return
+def _log(msg: str):
+    """写一行日志到 CONFIG['log_path'] 指定的文件（追加，带时间戳）。未设置则丢弃。"""
     path = CONFIG.get("log_path")
     if not path:
         return
@@ -310,7 +303,7 @@ async def chat_completions(request: Request,
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
                   if isinstance(t, dict)]
     last_user = _last_user_text(messages)
-    _log("req", f"→ {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
+    _log(f"→ {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
 
@@ -331,13 +324,13 @@ async def chat_completions(request: Request,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
-                    _log("req", f"✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
+                    _log(f"✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
                     raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
                 collected = await _collect_stream(r)
     except HTTPException:
         raise
     except httpx.HTTPError as e:
-        _log("req", f"✗ 网络错误 | {model_name} | {e}")
+        _log(f"✗ 网络错误 | {model_name} | {e}")
         raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
     _log_finish(model_name, t0, collected)
     return JSONResponse(content=collected)
@@ -370,12 +363,12 @@ def _log_finish(model_name: str, t0: float, result: dict):
     if finish == "content-filter":
         tag = " ⚠️内容审核拦截"
     tc_names = [t.get("function", {}).get("name") for t in tcs]
-    _log("req", f"← {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+    _log(f"← {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
          + (f" | tool_calls={tc_names}" if tc_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
-    # debug 级别：补一条响应预览
+    # 响应内容预览（短）
     if finish != "tool_calls" and msg.get("content"):
-        _log("debug", f"   resp预览: {_truncate(msg.get('content'), 120)!r}")
+        _log(f"   resp预览: {_truncate(msg.get('content'), 120)!r}")
 
 
 async def _collect_stream(response: httpx.Response) -> dict:
@@ -501,7 +494,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
-                    _log("req", f"✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),120)}")
+                    _log(f"✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),120)}")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
@@ -509,13 +502,13 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                         _feed(chunk)
                         yield chunk
     except httpx.HTTPError as e:
-        _log("req", f"✗ 网络错误 | {model_name} | {e}")
+        _log(f"✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
 
     # 流结束：输出完成日志
     elapsed = time.time() - t0 if t0 else 0
     tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
-    _log("req", f"← {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+    _log(f"← {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
          + (f" | tool_calls={tool_names}" if tool_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
 
@@ -572,17 +565,15 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
-    ap.add_argument("--log", default="off",
-                    choices=["off", "req", "debug"],
-                    help="日志级别：off(默认,不记) / req(每次请求摘要) / debug(含响应预览)")
-    ap.add_argument("--log-file", default=os.environ.get("CODEBUDDY2OPENAI_LOG", "converter.log"),
-                    help="日志文件路径（默认 ./converter.log；--log off 时忽略）")
+    ap.add_argument("--log", default=None, metavar="PATH",
+                    help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
+                         "不传则不记日志。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
-    CONFIG["log_level"] = args.log
-    CONFIG["log_path"] = args.log_file if args.log != "off" else None
+    # --log 直接指定文件路径即开启；不传则不记
+    CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
@@ -595,12 +586,12 @@ def main():
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
-    if args.log != "off":
-        sys.stderr.write(f"   日志      : {args.log} -> {args.log_file}\n")
+    if CONFIG["log_path"]:
+        sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
-    _log("req", f"==== converter 启动 (log={args.log}) ====")
+    _log(f"==== converter 启动 ====")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

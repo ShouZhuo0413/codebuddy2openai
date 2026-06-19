@@ -144,8 +144,7 @@ codebuddy2openai/
 ### 🔧 命令行参数
 
 ```
-python3 converter.py [--host HOST] [--port PORT] [--api-key KEY]
-                     [--log LEVEL] [--log-file PATH] [--skip-check]
+python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [--skip-check]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -153,24 +152,22 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY]
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 启用鉴权；客户端需带同样 key（也可用环境变量 `CODEBUDDY2OPENAI_KEY`）|
-| `--log` | `off` | 日志级别：`off`（不记）/`req`（每次请求摘要：模型、是否流式、耗时、finish_reason、工具调用、token、是否被审核拦截）/`debug`（再补一条响应内容预览）|
-| `--log-file` | `converter.log` | 日志文件路径（追加写，带时间戳；也可用环境变量 `CODEBUDDY2OPENAI_LOG`）|
+| `--log` | 无 | **开启日志并写到该文件**（如 `--log converter.log`）。不传则不记。也可用环境变量 `CODEBUDDY2OPENAI_LOG`。|
 | `--skip-check` | 否 | 跳过启动预检 |
 
 示例：
 ```bash
-python3 converter.py --log req                     # 记每次请求到 converter.log
-python3 converter.py --log debug --log-file /tmp/cb.log   # 详细日志写到指定文件
+python3 converter.py --log converter.log          # 记日志到当前目录 converter.log
+python3 converter.py --log /tmp/cb.log            # 记到指定路径
+python3 converter.py                              # 不记日志
 ```
 
-日志示例（`--log req`）：
+每条日志记录：模型、是否流式、消息数、最后一条用户提问、耗时、finish_reason、工具调用、token 数、响应内容预览；若后端内容审核拦截会标 `⚠️内容审核拦截`。示例：
 ```
-[2026-06-19 11:47:53] → glm-5.2 | stream=False | msgs=1 | last_user='Reply with: ok'
-[2026-06-19 11:47:56] ← glm-5.2 | 2.7s | finish=stop | tokens=12
-[2026-06-19 11:48:00] ← glm-5.2 | 4.0s | stream finish=tool_calls | tool_calls=['Read'] | tokens=164
+[2026-06-19 11:52:01] → glm-5.2 | stream=False | msgs=1 | last_user='Reply with: ok'
+[2026-06-19 11:52:04] ← glm-5.2 | 3.6s | finish=stop | tokens=12
+[2026-06-19 11:52:04]    resp预览: 'ok'
 ```
-
-> 注：`--log req` 时若后端返回内容审核拦截，日志里会标 `⚠️内容审核拦截`，方便定位（见下方 FAQ）。
 
 ### ❓ 常见问题
 
