@@ -144,7 +144,8 @@ codebuddy2openai/
 ### 🔧 命令行参数
 
 ```
-python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--cwd DIR] [--skip-check]
+python3 converter.py [--host HOST] [--port PORT] [--api-key KEY]
+                     [--log LEVEL] [--log-file PATH] [--skip-check]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -152,15 +153,31 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--cwd DIR] [--
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 启用鉴权；客户端需带同样 key（也可用环境变量 `CODEBUDDY2OPENAI_KEY`）|
-| `--cwd` | 当前目录 | CLI 工作目录 |
+| `--log` | `off` | 日志级别：`off`（不记）/`req`（每次请求摘要：模型、是否流式、耗时、finish_reason、工具调用、token、是否被审核拦截）/`debug`（再补一条响应内容预览）|
+| `--log-file` | `converter.log` | 日志文件路径（追加写，带时间戳；也可用环境变量 `CODEBUDDY2OPENAI_LOG`）|
 | `--skip-check` | 否 | 跳过启动预检 |
+
+示例：
+```bash
+python3 converter.py --log req                     # 记每次请求到 converter.log
+python3 converter.py --log debug --log-file /tmp/cb.log   # 详细日志写到指定文件
+```
+
+日志示例（`--log req`）：
+```
+[2026-06-19 11:47:53] → glm-5.2 | stream=False | msgs=1 | last_user='Reply with: ok'
+[2026-06-19 11:47:56] ← glm-5.2 | 2.7s | finish=stop | tokens=12
+[2026-06-19 11:48:00] ← glm-5.2 | 4.0s | stream finish=tool_calls | tool_calls=['Read'] | tokens=164
+```
+
+> 注：`--log req` 时若后端返回内容审核拦截，日志里会标 `⚠️内容审核拦截`，方便定位（见下方 FAQ）。
 
 ### ❓ 常见问题
 
-- **找不到 CLI**：确认装了桌面端；或设环境变量 `CODEBUDDY_CODE_PATH` 指向 `cli/bin/codebuddy`。
-- **找不到登录文件**：在桌面端完成登录（不是只装、要登进去）。
-- **客户端报 401**：转换器若用了 `--api-key`，客户端那边要带同样的 key。
-- **响应慢**：CLI 首次调用冷启动，后续会快；也可换 `deepseek-v4-flash` 等更快的模型。
+- **找不到登录文件**：在桌面端完成登录（不是只装、要登进去）。路径见上方「前置条件」。
+- **客户端报 401**：转换器若用了 `--api-key`，客户端那边要带同样的 key；若是后端 401，可能是 token 失效（转换器会自动刷新，若仍失败需在桌面端重新登录）。
+- **响应慢**：可换 `deepseek-v4-flash` 等更快的模型。
+- **"敏感内容"被拦截**：这是 CodeBuddy 后端的**内容审核**（腾讯合规策略），在模型推理之前就拦了，转换器无法绕过。常见触发原因是客户端注入的 system prompt 里含安全相关英文术语（如 DoS / exploit / credential / C2 等）。用 `--log req` 可在日志里看到 `⚠️内容审核拦截` 标记来定位。
 
 ### ⚠️ 免责声明
 

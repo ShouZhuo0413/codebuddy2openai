@@ -201,7 +201,42 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
-CONFIG: dict = {"api_key": "", "cred": None}  # cred: CredentialManager | None
+CONFIG: dict = {"api_key": "", "cred": None, "log_level": "req",
+                "log_path": None}  # cred: CredentialManager | None
+
+
+# ---------------------------------------------------------------------------
+# 日志（写文件）
+# ---------------------------------------------------------------------------
+
+_LOG_LOCK = threading.Lock()
+
+
+def _log(level: str, msg: str):
+    """按级别写日志到文件。level: req/debug。低于当前 log_level 则丢弃。
+
+    日志文件由 CONFIG['log_path'] 指定（main 启动时设置）；每次追加写、带时间戳。
+    """
+    order = {"off": 0, "req": 1, "debug": 2}
+    if order.get(level, 1) > order.get(CONFIG.get("log_level", "req"), 1):
+        return
+    path = CONFIG.get("log_path")
+    if not path:
+        return
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    try:
+        with _LOG_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError:
+        pass  # 日志失败不应影响主流程
+
+
+
+
+def _truncate(s: str, n: int = 80) -> str:
+    s = str(s).replace("\n", " ").strip()
+    return s[:n] + ("…" if len(s) > n else "")
 
 
 def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
@@ -270,12 +305,22 @@ async def chat_completions(request: Request,
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
+    # 日志：请求摘要
+    model_name = payload.get("model", "auto")
+    tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
+                  if isinstance(t, dict)]
+    last_user = _last_user_text(messages)
+    _log("req", f"→ {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
+         + (f" | tools={tool_names}" if tool_names else "")
+         + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
+
     headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
+    t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body),
+            _stream_upstream(url, headers, body, model_name, t0),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -286,13 +331,51 @@ async def chat_completions(request: Request,
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
+                    _log("req", f"✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),120)}")
                     raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
                 collected = await _collect_stream(r)
     except HTTPException:
         raise
     except httpx.HTTPError as e:
+        _log("req", f"✗ 网络错误 | {model_name} | {e}")
         raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+    _log_finish(model_name, t0, collected)
     return JSONResponse(content=collected)
+
+
+def _last_user_text(messages: list) -> str:
+    """取最后一条 user 消息的文本，用于日志预览。"""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    return str(blk.get("text", ""))
+            return ""
+        return str(content)
+    return ""
+
+
+def _log_finish(model_name: str, t0: float, result: dict):
+    """记录一次完成的请求：耗时 / finish_reason / usage / 工具调用 / 审核拦截。"""
+    elapsed = time.time() - t0
+    choice = (result.get("choices") or [{}])[0]
+    finish = choice.get("finish_reason")
+    msg = choice.get("message") or {}
+    tcs = msg.get("tool_calls") or []
+    usage = result.get("usage") or {}
+    tag = ""
+    if finish == "content-filter":
+        tag = " ⚠️内容审核拦截"
+    tc_names = [t.get("function", {}).get("name") for t in tcs]
+    _log("req", f"← {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+         + (f" | tool_calls={tc_names}" if tc_names else "")
+         + f" | tokens={usage.get('total_tokens', '?')}")
+    # debug 级别：补一条响应预览
+    if finish != "tool_calls" and msg.get("content"):
+        _log("debug", f"   resp预览: {_truncate(msg.get('content'), 120)!r}")
 
 
 async def _collect_stream(response: httpx.Response) -> dict:
@@ -368,21 +451,73 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-async def _stream_upstream(url: str, headers: dict, body: dict):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。"""
-    # token 在流式期间可能过期；此处简化处理（get_headers 已在请求前刷新）
+async def _stream_upstream(url: str, headers: dict, body: dict,
+                           model_name: str = "?", t0: float = 0.0):
+    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+
+    同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
+    """
+    finish_reason = None
+    tool_names: list[str] = []
+    usage: dict = {}
+    saw_filter = False
+    buf = b""
+
+    def _feed(chunk: bytes):
+        nonlocal finish_reason, saw_filter, buf
+        # 行缓冲解析：把累计的 chunk 按 data: 行切出来统计
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            if obj.get("usage"):
+                usage.update(obj["usage"])
+            for ch in obj.get("choices") or []:
+                if ch.get("finish_reason"):
+                    finish_reason = ch["finish_reason"]
+                for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                    nm = (tc.get("function") or {}).get("name")
+                    if nm:
+                        tool_names.append(nm)
+            # 内容审核拦截常以 content-filter 或特殊中文文案返回
+            try:
+                text_repr = data.decode("utf-8", "replace")
+            except Exception:
+                text_repr = ""
+            if "content-filter" in text_repr or "敏感" in text_repr or "审核" in text_repr:
+                saw_filter = True
+
     try:
         async with httpx.AsyncClient(timeout=None) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
+                    _log("req", f"✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),120)}")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
                     if chunk:
+                        _feed(chunk)
                         yield chunk
     except httpx.HTTPError as e:
+        _log("req", f"✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
+
+    # 流结束：输出完成日志
+    elapsed = time.time() - t0 if t0 else 0
+    tag = " ⚠️内容审核拦截" if (saw_filter or finish_reason == "content-filter") else ""
+    _log("req", f"← {model_name} | {elapsed:.1f}s | stream finish={finish_reason}{tag}"
+         + (f" | tool_calls={tool_names}" if tool_names else "")
+         + f" | tokens={usage.get('total_tokens', '?')}")
 
 
 def _safe_err(r: httpx.Response) -> dict:
@@ -437,10 +572,17 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2OPENAI_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
+    ap.add_argument("--log", default="off",
+                    choices=["off", "req", "debug"],
+                    help="日志级别：off(默认,不记) / req(每次请求摘要) / debug(含响应预览)")
+    ap.add_argument("--log-file", default=os.environ.get("CODEBUDDY2OPENAI_LOG", "converter.log"),
+                    help="日志文件路径（默认 ./converter.log；--log off 时忽略）")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
+    CONFIG["log_level"] = args.log
+    CONFIG["log_path"] = args.log_file if args.log != "off" else None
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
@@ -453,7 +595,12 @@ def main():
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
+    if args.log != "off":
+        sys.stderr.write(f"   日志      : {args.log} -> {args.log_file}\n")
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
+
+    # 启动时写一条标记
+    _log("req", f"==== converter 启动 (log={args.log}) ====")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
