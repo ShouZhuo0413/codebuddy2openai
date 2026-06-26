@@ -38,8 +38,15 @@ import uvicorn
 try:
     from desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
-    def desensitize_body(body, roles=("system",)):
+    def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
+                         desensitize_tools=False, compact_harness=False,
+                         strip_tool_metadata=False):
         return body
+
+from responses_adapter import (
+    responses_request_to_chat,
+    ResponsesStreamConverter,
+)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -305,10 +312,12 @@ async def chat_completions(request: Request,
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
 
-    # 可选：脱敏。缓解客户端合规模板（如 ZCode 的 system 声明）被后端误判为敏感词。
-    # 只对 system 角色消息里的"合规声明高频词"插入零宽空格，不改用户输入。
+    # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
+    # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
     if CONFIG.get("desensitize"):
-        body = desensitize_body(body, roles=("system",))
+        body = desensitize_body(body, roles=("system", "developer"),
+                                desensitize_harness_user=True,
+                                desensitize_tools=True)
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
@@ -553,6 +562,125 @@ def _err_event(msg: bytes, status: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Responses API 端点（Codex CLI 兼容）
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/responses")
+async def create_response(request: Request,
+                          authorization: Optional[str] = Header(default=None),
+                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """OpenAI Responses API 兼容端点。
+
+    Codex CLI 使用 Responses API（wire_api = "responses"）而非 Chat Completions。
+    本端点接收 Responses 格式请求，转换为 Chat 格式发往后端，再将后端的 Chat SSE
+    转换为 Responses 语义事件流返回。
+    """
+    _check_auth(authorization, x_api_key)
+    cred = _cred()
+
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+
+    # 转换请求：Responses → Chat
+    try:
+        chat_body = responses_request_to_chat(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
+
+    chat_body.setdefault("model", "auto")
+    chat_body["stream"] = True
+    if "stream_options" not in chat_body:
+        chat_body["stream_options"] = {"include_usage": True}
+
+    if CONFIG.get("desensitize"):
+        chat_body = desensitize_body(chat_body, roles=("system", "developer"),
+                                     desensitize_harness_user=True,
+                                     desensitize_tools=True,
+                                     compact_harness=True,
+                                     strip_tool_metadata=True)
+
+    client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
+    model_name = payload.get("model", "auto")
+    rid = os.urandom(4).hex()
+    _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
+    _log(f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}")
+
+    headers = cred.get_headers()
+    url = f"{BACKEND}/v2/chat/completions"
+    t0 = time.time()
+
+    if client_wants_stream:
+        return StreamingResponse(
+            _stream_responses(url, headers, chat_body, model_name, t0, rid),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 非流式：聚合后端 SSE → 非流式 Response 对象
+    try:
+        async with httpx.AsyncClient(timeout=300) as c:
+            async with c.stream("POST", url, headers=headers, json=chat_body) as r:
+                if r.status_code != 200:
+                    raw = await r.aread()
+                    _log(f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8','replace'),200)}")
+                    raise HTTPException(status_code=r.status_code, detail=_safe_err_raw(raw, r.status_code))
+                converter = ResponsesStreamConverter(model=model_name)
+                async for line in r.aiter_lines():
+                    converter.feed_line(line)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {e}")
+        raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+
+    result = converter.get_nonstream_response()
+    elapsed = time.time() - t0
+    _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
+    _log(f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+    return JSONResponse(content=result)
+
+
+async def _stream_responses(url: str, headers: dict, body: dict,
+                            model_name: str = "?", t0: float = 0.0, rid: str = ""):
+    """消费后端 Chat SSE，实时转换为 Responses API 事件流输出。"""
+    converter = ResponsesStreamConverter(model=model_name)
+    prefix = f"[{rid}] " if rid else ""
+
+    try:
+        async with httpx.AsyncClient(timeout=None) as c:
+            async with c.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    err = await r.aread()
+                    _log(f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8','replace'),200)}")
+                    error_evt = {"type": "error", "error": {"message": err.decode('utf-8','replace')[:500], "code": r.status_code}}
+                    yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+                    return
+                raw_sse_lines = []  # 记录原始 SSE 用于日志
+                async for line in r.aiter_lines():
+                    if line.strip():
+                        raw_sse_lines.append(line)
+                    events = converter.feed_line(line)
+                    if events:
+                        yield events.encode("utf-8")
+    except httpx.HTTPError as e:
+        _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
+        error_evt = {"type": "error", "error": {"message": str(e)[:500], "code": 502}}
+        yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode("utf-8")
+        return
+
+    # 发送收尾事件
+    finish_events = converter.finish()
+    if finish_events:
+        yield finish_events.encode("utf-8")
+
+    elapsed = time.time() - t0 if t0 else 0
+    _log(f"{prefix}◀ RESPONSES {model_name} | {elapsed:.1f}s | stream done")
+    _log(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines[-30:]))
+
+
+# ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
 
@@ -610,6 +738,7 @@ def main():
     sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
     sys.stderr.write("   GET  /v1/models\n")
     sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
+    sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")

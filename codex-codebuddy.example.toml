@@ -1,34 +1,40 @@
 # ============================================================
 # CodeBuddy/WorkBuddy 订阅 -> OpenAI 兼容客户端 —— provider 配置示例（片段）
 # ------------------------------------------------------------
-# ⚠️ 重要说明：
-#   新版 Codex CLI 已移除 wire_api = "chat" 的支持，只支持 completions 格式，
-#   因此【本转换器无法接入 Codex CLI】。这个文件主要给那些支持
-#   「自定义 OpenAI 兼容 provider（读 toml 片段）」的第三方客户端作参考，
-#   例如 ZCode、Cherry Studio 等。
-#
-#   如果你的客户端是图形界面（Cherry Studio / NextChat 等），通常不需要这个文件，
-#   只需在「自定义模型 / OpenAI 兼容」里填：
-#     接口地址 base_url : http://127.0.0.1:8787/v1
-#     API Key          : 留空（除非转换器启动时用了 --api-key）
-#     模型名 model     : glm-5.2 （或 kimi-k2.7 / deepseek-v4-pro / auto）
-#
 # 前提：转换器已在本地运行（见 README.md）
 #   python3 converter.py --port 8787
 #
-# ⚠️ 本文件只是「示例」。若你的客户端需要合并配置，请【手动】把下面两段
+# ⚠️ 本文件只是「示例」。若你的客户端需要合并配置，请【手动】把下面的段落
 #    复制/合并进你自己的配置文件。本脚本绝不自动改写任何已有配置。
 # ============================================================
 
-# 1) 定义一个指向本地转换器的「模型提供商」
+
+# ── 方式一：Codex CLI（Responses API）──────────────────────
+# 新版 Codex CLI 使用 Responses API（wire_api = "responses"）。
+# 转换器已支持 POST /v1/responses 端点，可直接接入 Codex CLI。
+#
+# 将以下配置合并到 ~/.codex/config.toml（或项目 codex.toml）：
+
 [model_providers.codebuddy]
 name = "CodeBuddy (via local converter)"
 base_url = "http://127.0.0.1:8787/v1"
-env_key = "CODEBUDDY2OPENAI_KEY"   # 转换器未启用 --api-key 时，可随便填一个环境变量名
-# 注意：本接口是 OpenAI chat 协议（/v1/chat/completions）。
-# 新版 Codex CLI 因不再支持该 wire_api 而无法使用，请用 ZCode / Cherry Studio 等 OpenAI 兼容客户端。
+wire_api = "responses"              # ← 关键：使用 Responses API
+env_key = "CODEBUDDY2OPENAI_KEY"    # 转换器未启用 --api-key 时，可随便填一个环境变量名
 
-# 2) 定义一个使用该提供商的 profile（仅支持该配置格式的客户端需要）
 [profiles.codebuddy]
-model = "glm-5.2"                  # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
+model = "glm-5.2"                   # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
 model_provider = "codebuddy"
+
+# 然后设置环境变量（值随便填，除非转换器启用了 --api-key）：
+#   export CODEBUDDY2OPENAI_KEY=any-value
+#
+# 启动 Codex CLI：
+#   codex --profile codebuddy "你的任务描述"
+
+
+# ── 方式二：Cherry Studio / ZCode 等 OpenAI 兼容客户端 ─────
+# 这些客户端使用 Chat Completions API（/v1/chat/completions），
+# 转换器原生支持，只需在客户端的「自定义模型 / OpenAI 兼容」里填：
+#   接口地址 base_url : http://127.0.0.1:8787/v1
+#   API Key          : 留空（除非转换器启动时用了 --api-key）
+#   模型名 model     : glm-5.2 （或 kimi-k2.7 / deepseek-v4-pro / auto）

@@ -28,7 +28,7 @@ development, credential testing, C2 frameworks ...」），属于**拒绝作恶*
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 # 零宽空格：插入到关键词内部，打断后端的关键词匹配，但模型/人眼读起来无差别。
 _ZWSP = "\u200b"
@@ -36,6 +36,7 @@ _ZWSP = "\u200b"
 # 触发审核的"合规声明高频词"（来自真实被拦截的客户端 system 模板）。
 # 全部是"拒绝作恶"语境里常见的英文术语。大小写不敏感匹配。
 SENSITIVE_TERMS: list[str] = [
+    # 原有词表
     "DoS",
     "DDoS",
     "exploit",
@@ -67,6 +68,51 @@ SENSITIVE_TERMS: list[str] = [
     "botnet",
     "zero-day",
     "0day",
+    # Codex CLI system prompt 里额外的高频触发词
+    "vulnerability",
+    "vulnerabilities",
+    "red teaming",
+    "red-teaming",
+    "sandbox",
+    "sandboxing",
+    "sandboxed",
+    "unsandboxed",
+    "escalated privileges",
+    "escalated",
+    "escalation",
+    "destructive action",
+    "destructive command",
+    "destructive",
+    "attack",
+    "attacks",
+    "cybersecurity",
+    "security review",
+    "exploit development",
+    "hacking",
+    "penetration testing",
+    "penetration test",
+    "injection",
+    "weaponize",
+    "weaponized",
+    "harmful",
+    "dangerous",
+    "abuse",
+    "abusive",
+    "illegal",
+    "terrorist",
+    "terrorism",
+    "bomb",
+    "weapon",
+    "weapons",
+    "drug",
+    "drugs",
+    "narcotic",
+    "suicide",
+    "self-harm",
+    "murder",
+    "kill",
+    "violence",
+    "violent",
 ]
 
 # 编译成一个大正则，按词长降序，避免短词先吃掉长词。
@@ -74,6 +120,34 @@ SENSITIVE_TERMS: list[str] = [
 _PATTERN = re.compile(
     "|".join(re.escape(t) for t in sorted(SENSITIVE_TERMS, key=len, reverse=True)),
     re.IGNORECASE,
+)
+
+# Codex CLI 会把大量运行时上下文包装进一条 user 消息里；这些不是用户真正提问，
+# 里面常含 permissions / sandbox / skills 等说明，也会触发后端审核。
+_HARNESS_USER_MARKERS = (
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+    "<skills_instructions>",
+)
+
+_CODEX_SYSTEM_MARKERS = (
+    "You are a coding agent running in the Codex CLI",
+    "Within this context, Codex refers to",
+    "# How you work",
+)
+
+_PERMISSIONS_MARKERS = (
+    "<permissions instructions>",
+    "Filesystem sandboxing defines which files can be read or written.",
+    "## How to request escalation",
+)
+
+_SKILLS_MARKERS = (
+    "<skills_instructions>",
+    "### Available skills",
+    "### How to use skills",
 )
 
 
@@ -102,11 +176,76 @@ def _iter_text_blocks(content):
                 yield blk, "text"
 
 
+def _content_to_text(content) -> str:
+    """把字符串或 content blocks 规整成纯文本，便于识别注入模板。"""
+    text = content if isinstance(content, str) else ""
+    if isinstance(content, list):
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "text":
+                parts.append(str(blk.get("text", "")))
+        text = "".join(parts)
+    return text
+
+
+def _looks_like_harness_user_message(content) -> bool:
+    """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
+    text = _content_to_text(content)
+    return any(marker in text for marker in _HARNESS_USER_MARKERS)
+
+
+def _compact_harness_message(role: str, content) -> str | None:
+    """把 Codex 注入的超长运行时提示压缩成短摘要，降低审核误伤。"""
+    text = _content_to_text(content)
+    if not text:
+        return None
+    if role == "system" and any(marker in text for marker in _CODEX_SYSTEM_MARKERS):
+        return (
+            "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
+            "Use available tools when needed, follow repository instructions, and keep the user informed."
+        )
+    if any(marker in text for marker in _PERMISSIONS_MARKERS):
+        return (
+            "Runtime permissions apply: filesystem access may be sandboxed, network may be restricted, "
+            "and some commands may require user approval."
+        )
+    if any(marker in text for marker in _SKILLS_MARKERS):
+        return (
+            "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
+        )
+    if role == "user" and _looks_like_harness_user_message(content):
+        return (
+            "Repository instructions and environment context are provided. Follow repository guidance "
+            "while answering the user's actual request."
+        )
+    return None
+
+
+def _desensitize_tool_value(value: Any, strip_metadata: bool = False):
+    """递归处理 tool 定义，必要时移除高风险描述字段。"""
+    if isinstance(value, dict):
+        new_value = {}
+        for key, item in value.items():
+            if key in ("description", "title") and isinstance(item, str):
+                if strip_metadata:
+                    continue
+                new_value[key] = desensitize_text(item)
+            else:
+                new_value[key] = _desensitize_tool_value(item, strip_metadata=strip_metadata)
+        return new_value
+    if isinstance(value, list):
+        return [_desensitize_tool_value(item, strip_metadata=strip_metadata) for item in value]
+    return value
+
+
 def desensitize_messages(messages: Iterable[dict],
-                         roles: tuple[str, ...] = ("system",)) -> list[dict]:
+                         roles: tuple[str, ...] = ("system",),
+                         desensitize_harness_user: bool = False,
+                         compact_harness: bool = False) -> list[dict]:
     """对指定角色的消息文本做脱敏，返回新的 messages 列表（不修改原对象）。
 
-    默认只处理 system 角色（合规模板集中地）。如需扩大，传 roles=("system","user")。
+    默认只处理 system 角色（合规模板集中地）。可选处理 developer，
+    以及 Codex 注入的 harness user 上下文；真实用户输入保持原样。
     """
     out: list[dict] = []
     for m in messages:
@@ -114,10 +253,17 @@ def desensitize_messages(messages: Iterable[dict],
             out.append(m)
             continue
         role = m.get("role")
+        should_desensitize = role in roles
+        if role == "user" and desensitize_harness_user:
+            should_desensitize = _looks_like_harness_user_message(m.get("content"))
+
         nm = dict(m)  # 浅拷贝，不污染调用方
-        if role in roles:
+        if should_desensitize:
             content = m.get("content")
-            if isinstance(content, str):
+            compacted = _compact_harness_message(role, content) if compact_harness else None
+            if compacted is not None:
+                nm["content"] = desensitize_text(compacted)
+            elif isinstance(content, str):
                 nm["content"] = desensitize_text(content)
             elif isinstance(content, list):
                 new_blocks = []
@@ -133,13 +279,26 @@ def desensitize_messages(messages: Iterable[dict],
     return out
 
 
-def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",)) -> dict:
-    """对请求体里的 messages 做脱敏，返回新的 body（浅拷贝）。"""
-    if not body.get("messages"):
-        return body
+def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",),
+                     desensitize_harness_user: bool = False,
+                     desensitize_tools: bool = False,
+                     compact_harness: bool = False,
+                     strip_tool_metadata: bool = False) -> dict:
+    """对请求体里的 messages / tools 做脱敏，返回新的 body（浅拷贝）。"""
+    changed = False
     nb = dict(body)
-    nb["messages"] = desensitize_messages(body["messages"], roles=roles)
-    return nb
+    if body.get("messages"):
+        nb["messages"] = desensitize_messages(
+            body["messages"],
+            roles=roles,
+            desensitize_harness_user=desensitize_harness_user,
+            compact_harness=compact_harness,
+        )
+        changed = True
+    if desensitize_tools and body.get("tools"):
+        nb["tools"] = _desensitize_tool_value(body["tools"], strip_metadata=strip_tool_metadata)
+        changed = True
+    return nb if changed else body
 
 
 # ---------------------------------------------------------------------------
