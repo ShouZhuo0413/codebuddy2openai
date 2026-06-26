@@ -202,6 +202,10 @@ python3 converter.py                              # 不记日志
 - **响应慢**：可换 `deepseek-v4-flash` 等更快的模型。
 - **"敏感内容"被拦截**：这是 CodeBuddy 后端的**内容审核**（腾讯合规策略），在模型推理之前就拦了。对 Codex CLI 来说，常见触发点不只是一条 system prompt，还包括客户端注入的 `developer` 说明、运行时上下文（如 `AGENTS.md` / sandbox / permissions / skills 文本），以及工具 schema 的 `description` 字段——这些内容里常含 DoS / exploit / credential / sandbox / escalation / dangerous 等安全术语，虽然语义上是在**约束模型拒绝作恶**，但仍可能被后端误伤。两种应对：①用 `--log xxx.log` 在日志里看 `⚠️内容审核拦截` 标记，直接定位对应请求的 `REQUEST BODY`；②加 `--desensitize` 启用脱敏模块（`desensitize.py`），它会对这些客户端固定模板/上下文字段做零宽脱敏，并进一步把 Codex CLI 注入的超长运行时提示压缩成短摘要、移除 `tools` 里的高风险描述字段，同时**不改真实用户输入**。这比只改 system prompt 更适合 Codex CLI 场景。注意：这些处理只针对客户端固定模板，不能也不应绕过对用户真实有害输入的审核。
 
+### 🙏 致谢
+
+本项目基于 [HanHan666666](https://github.com/HanHan666666) 的 [codebuddy2openai](https://github.com/HanHan666666/codebuddy2openai) 项目，感谢原作者的开源贡献。
+
 ### ⚠️ 免责声明
 
 本项目为个人学习与研究用途，非官方产品，与腾讯 / CodeBuddy / OpenAI 无任何关联。使用本工具即表示你已阅读并同意：仅在你拥有合法订阅的前提下使用，遵守相关服务条款，自负风险。
@@ -264,6 +268,10 @@ python3 converter.py [--host HOST] [--port PORT] [--api-key KEY] [--log PATH] [-
 | `--log` | none | Write logs to this file (e.g. `--log converter.log`). Also via `CODEBUDDY2OPENAI_LOG`. |
 | `--desensitize` | off | Zero-width desensitization of client-injected compliance/runtime text to avoid backend content-review false positives |
 | `--skip-check` | no | Skip startup preflight |
+
+### 🙏 Acknowledgements
+
+This project is based on [codebuddy2openai](https://github.com/HanHan666666/codebuddy2openai) by [HanHan666666](https://github.com/HanHan666666). Thanks to the original author for their open-source contribution.
 
 ### ⚠️ Disclaimer
 
